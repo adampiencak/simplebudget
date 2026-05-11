@@ -4,63 +4,72 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Txn,
   Settings,
-  loadTxns,
-  saveTxns,
-  loadSettings,
-  saveSettings,
+  fetchTxns,
+  insertTxn,
+  deleteTxnById,
+  fetchSettings,
+  upsertSettings,
   defaultSettings,
-  uid,
   todayISO,
   ymOf,
   currentYM,
   formatMoney,
-  signed,
 } from "@/lib/storage";
+import { createClient } from "@/lib/supabase/client";
 
 type Tab = "home" | "add" | "settings";
 
 export default function Page() {
-  const [hydrated, setHydrated] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [txns, setTxns] = useState<Txn[]>([]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
+  const [email, setEmail] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("home");
   const [viewYM, setViewYM] = useState<string>(currentYM());
 
-  // Hydrate from localStorage
   useEffect(() => {
-    setTxns(loadTxns());
-    setSettings(loadSettings());
-    setHydrated(true);
+    (async () => {
+      const supabase = createClient();
+      const { data } = await supabase.auth.getUser();
+      setEmail(data.user?.email ?? null);
+      const [t, s] = await Promise.all([fetchTxns(), fetchSettings()]);
+      setTxns(t);
+      setSettings(s);
+      setLoaded(true);
+    })();
   }, []);
 
-  // Auto-log salary on payday
+  // Auto-log salary once on or after pay day each month
   useEffect(() => {
-    if (!hydrated) return;
+    if (!loaded) return;
     if (!settings.autoSalary || settings.salary <= 0) return;
     const now = new Date();
     const ym = currentYM();
     if (now.getDate() >= settings.payDay && settings.lastAutoSalaryYM !== ym) {
       const day = String(settings.payDay).padStart(2, "0");
       const iso = `${ym}-${day}`;
-      const newTxn: Txn = {
-        id: uid(),
-        kind: "income",
-        amount: settings.salary,
-        note: "Salary",
-        date: iso,
-        createdAt: Date.now(),
-      };
-      const next = [newTxn, ...txns];
-      setTxns(next);
-      saveTxns(next);
-      const ns = { ...settings, lastAutoSalaryYM: ym };
-      setSettings(ns);
-      saveSettings(ns);
+      (async () => {
+        const created = await insertTxn({
+          kind: "income",
+          amount: settings.salary,
+          note: "Salary",
+          date: iso,
+        });
+        if (created) {
+          setTxns((prev) => [created, ...prev]);
+          const ns = { ...settings, lastAutoSalaryYM: ym };
+          setSettings(ns);
+          await upsertSettings(ns);
+        }
+      })();
     }
-  }, [hydrated, settings, txns]);
+  }, [loaded, settings]);
 
   const monthTxns = useMemo(
-    () => txns.filter((t) => ymOf(t.date) === viewYM).sort((a, b) => (a.date < b.date ? 1 : -1)),
+    () =>
+      txns
+        .filter((t) => ymOf(t.date) === viewYM)
+        .sort((a, b) => (a.date < b.date ? 1 : -1)),
     [txns, viewYM]
   );
 
@@ -74,22 +83,20 @@ export default function Page() {
     return { income, expense, balance: income - expense };
   }, [monthTxns]);
 
-  function addTxn(t: Omit<Txn, "id" | "createdAt">) {
-    const next = [{ ...t, id: uid(), createdAt: Date.now() }, ...txns];
-    setTxns(next);
-    saveTxns(next);
+  async function addTxn(t: Omit<Txn, "id" | "createdAt">) {
+    const created = await insertTxn(t);
+    if (created) setTxns((prev) => [created, ...prev]);
     setTab("home");
   }
 
-  function deleteTxn(id: string) {
-    const next = txns.filter((t) => t.id !== id);
-    setTxns(next);
-    saveTxns(next);
+  async function deleteTxn(id: string) {
+    const ok = await deleteTxnById(id);
+    if (ok) setTxns((prev) => prev.filter((t) => t.id !== id));
   }
 
-  function updateSettings(s: Settings) {
+  async function updateSettings(s: Settings) {
     setSettings(s);
-    saveSettings(s);
+    await upsertSettings(s);
   }
 
   function shiftMonth(delta: number) {
@@ -99,8 +106,18 @@ export default function Page() {
     setViewYM(`${d.getFullYear()}-${mm}`);
   }
 
-  if (!hydrated) {
-    return <div className="min-h-screen" />;
+  async function signOut() {
+    const supabase = createClient();
+    await supabase.auth.signOut();
+    location.href = "/login";
+  }
+
+  if (!loaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-neutral-500 text-sm">
+        Loading…
+      </div>
+    );
   }
 
   return (
@@ -117,8 +134,17 @@ export default function Page() {
           onDelete={deleteTxn}
         />
       )}
-      {tab === "add" && <AddForm settings={settings} onAdd={addTxn} onCancel={() => setTab("home")} />}
-      {tab === "settings" && <SettingsView settings={settings} onSave={updateSettings} />}
+      {tab === "add" && (
+        <AddForm settings={settings} onAdd={addTxn} onCancel={() => setTab("home")} />
+      )}
+      {tab === "settings" && (
+        <SettingsView
+          settings={settings}
+          onSave={updateSettings}
+          email={email}
+          onSignOut={signOut}
+        />
+      )}
       <TabBar tab={tab} setTab={setTab} />
     </main>
   );
@@ -250,12 +276,15 @@ function AddForm({
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [saving, setSaving] = useState(false);
 
-  function submit(e: React.FormEvent) {
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
     const n = parseFloat(amount);
     if (!isFinite(n) || n <= 0) return;
-    onAdd({ kind, amount: n, note: note.trim(), date });
+    setSaving(true);
+    await onAdd({ kind, amount: n, note: note.trim(), date });
+    setSaving(false);
   }
 
   return (
@@ -265,8 +294,12 @@ function AddForm({
           Cancel
         </button>
         <h1 className="text-lg font-semibold">New entry</h1>
-        <button type="submit" className="text-green-400 font-medium px-2 py-2">
-          Save
+        <button
+          type="submit"
+          disabled={saving}
+          className="text-green-400 font-medium px-2 py-2 disabled:opacity-60"
+        >
+          {saving ? "Saving…" : "Save"}
         </button>
       </header>
 
@@ -332,9 +365,13 @@ function AddForm({
 function SettingsView({
   settings,
   onSave,
+  email,
+  onSignOut,
 }: {
   settings: Settings;
   onSave: (s: Settings) => void;
+  email: string | null;
+  onSignOut: () => void;
 }) {
   const [salary, setSalary] = useState(String(settings.salary || ""));
   const [currency, setCurrency] = useState(settings.currency);
@@ -351,43 +388,11 @@ function SettingsView({
     });
   }
 
-  function exportData() {
-    const data = {
-      txns: JSON.parse(localStorage.getItem("budget.txns.v1") || "[]"),
-      settings: JSON.parse(localStorage.getItem("budget.settings.v1") || "{}"),
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `budget-${todayISO()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function importData(file: File) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(String(reader.result));
-        if (Array.isArray(parsed.txns)) {
-          localStorage.setItem("budget.txns.v1", JSON.stringify(parsed.txns));
-        }
-        if (parsed.settings && typeof parsed.settings === "object") {
-          localStorage.setItem("budget.settings.v1", JSON.stringify(parsed.settings));
-        }
-        location.reload();
-      } catch {
-        alert("Invalid file");
-      }
-    };
-    reader.readAsText(file);
-  }
-
   return (
     <div className="pt-2">
       <header className="py-2">
         <h1 className="text-lg font-semibold">Settings</h1>
+        {email && <div className="text-xs text-neutral-500 mt-1">Signed in as {email}</div>}
       </header>
 
       <div className="mt-4 space-y-4">
@@ -446,36 +451,12 @@ function SettingsView({
           />
         </label>
 
-        <div className="pt-4 border-t border-neutral-800 space-y-2">
+        <div className="pt-4 border-t border-neutral-800">
           <button
-            onClick={exportData}
-            className="w-full bg-neutral-900 rounded-xl px-4 py-3 text-left"
-          >
-            Export data (JSON)
-          </button>
-          <label className="block w-full bg-neutral-900 rounded-xl px-4 py-3 cursor-pointer">
-            Import data (JSON)
-            <input
-              type="file"
-              accept="application/json"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) importData(f);
-              }}
-            />
-          </label>
-          <button
-            onClick={() => {
-              if (confirm("Delete ALL data? This cannot be undone.")) {
-                localStorage.removeItem("budget.txns.v1");
-                localStorage.removeItem("budget.settings.v1");
-                location.reload();
-              }
-            }}
+            onClick={onSignOut}
             className="w-full bg-neutral-900 rounded-xl px-4 py-3 text-left text-red-400"
           >
-            Reset all data
+            Sign out
           </button>
         </div>
       </div>

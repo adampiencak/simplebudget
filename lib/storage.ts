@@ -1,9 +1,11 @@
+import { createClient } from "@/lib/supabase/client";
+
 export type TxnKind = "income" | "expense";
 
 export type Txn = {
   id: string;
   kind: TxnKind;
-  amount: number; // positive number, sign implied by kind
+  amount: number;
   note: string;
   date: string; // ISO yyyy-mm-dd
   createdAt: number;
@@ -11,14 +13,11 @@ export type Txn = {
 
 export type Settings = {
   salary: number;
-  currency: string; // ISO 4217
-  payDay: number; // day of month (1-31)
+  currency: string;
+  payDay: number;
   autoSalary: boolean;
-  lastAutoSalaryYM: string | null; // "YYYY-MM" of last auto-logged salary
+  lastAutoSalaryYM: string | null;
 };
-
-const TXN_KEY = "budget.txns.v1";
-const SET_KEY = "budget.settings.v1";
 
 export const defaultSettings: Settings = {
   salary: 0,
@@ -28,38 +27,141 @@ export const defaultSettings: Settings = {
   lastAutoSalaryYM: null,
 };
 
-export function loadTxns(): Txn[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = localStorage.getItem(TXN_KEY);
-    return raw ? (JSON.parse(raw) as Txn[]) : [];
-  } catch {
+// ---------- DB row mappers ----------
+
+type TxnRow = {
+  id: string;
+  kind: TxnKind;
+  amount: number | string;
+  note: string | null;
+  date: string;
+  created_at: string;
+};
+
+function rowToTxn(r: TxnRow): Txn {
+  return {
+    id: r.id,
+    kind: r.kind,
+    amount: Number(r.amount),
+    note: r.note ?? "",
+    date: r.date,
+    createdAt: new Date(r.created_at).getTime(),
+  };
+}
+
+type SettingsRow = {
+  user_id: string;
+  salary: number | string;
+  currency: string;
+  pay_day: number;
+  auto_salary: boolean;
+  last_auto_salary_ym: string | null;
+};
+
+function rowToSettings(r: SettingsRow): Settings {
+  return {
+    salary: Number(r.salary),
+    currency: r.currency,
+    payDay: r.pay_day,
+    autoSalary: r.auto_salary,
+    lastAutoSalaryYM: r.last_auto_salary_ym,
+  };
+}
+
+// ---------- Transactions ----------
+
+export async function fetchTxns(): Promise<Txn[]> {
+  const supabase = createClient();
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("id,kind,amount,note,date,created_at")
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (error) {
+    console.error(error);
     return [];
   }
+  return (data as TxnRow[]).map(rowToTxn);
 }
 
-export function saveTxns(txns: Txn[]) {
-  localStorage.setItem(TXN_KEY, JSON.stringify(txns));
+export async function insertTxn(
+  t: Omit<Txn, "id" | "createdAt">
+): Promise<Txn | null> {
+  const supabase = createClient();
+  const { data: userData } = await supabase.auth.getUser();
+  const user = userData.user;
+  if (!user) return null;
+  const { data, error } = await supabase
+    .from("transactions")
+    .insert({
+      user_id: user.id,
+      kind: t.kind,
+      amount: t.amount,
+      note: t.note || null,
+      date: t.date,
+    })
+    .select("id,kind,amount,note,date,created_at")
+    .single();
+  if (error || !data) {
+    console.error(error);
+    return null;
+  }
+  return rowToTxn(data as TxnRow);
 }
 
-export function loadSettings(): Settings {
-  if (typeof window === "undefined") return defaultSettings;
-  try {
-    const raw = localStorage.getItem(SET_KEY);
-    if (!raw) return defaultSettings;
-    return { ...defaultSettings, ...(JSON.parse(raw) as Partial<Settings>) };
-  } catch {
+export async function deleteTxnById(id: string): Promise<boolean> {
+  const supabase = createClient();
+  const { error } = await supabase.from("transactions").delete().eq("id", id);
+  if (error) {
+    console.error(error);
+    return false;
+  }
+  return true;
+}
+
+// ---------- Settings ----------
+
+export async function fetchSettings(): Promise<Settings> {
+  const supabase = createClient();
+  const { data: userData } = await supabase.auth.getUser();
+  const user = userData.user;
+  if (!user) return defaultSettings;
+
+  const { data, error } = await supabase
+    .from("settings")
+    .select("*")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (error) {
+    console.error(error);
     return defaultSettings;
   }
+  if (!data) {
+    // Create a default row for this user
+    await supabase.from("settings").insert({ user_id: user.id });
+    return defaultSettings;
+  }
+  return rowToSettings(data as SettingsRow);
 }
 
-export function saveSettings(s: Settings) {
-  localStorage.setItem(SET_KEY, JSON.stringify(s));
+export async function upsertSettings(s: Settings): Promise<void> {
+  const supabase = createClient();
+  const { data: userData } = await supabase.auth.getUser();
+  const user = userData.user;
+  if (!user) return;
+  const { error } = await supabase.from("settings").upsert({
+    user_id: user.id,
+    salary: s.salary,
+    currency: s.currency,
+    pay_day: s.payDay,
+    auto_salary: s.autoSalary,
+    last_auto_salary_ym: s.lastAutoSalaryYM,
+  });
+  if (error) console.error(error);
 }
 
-export function uid(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
+// ---------- Helpers ----------
 
 export function todayISO(): string {
   const d = new Date();
@@ -86,8 +188,4 @@ export function formatMoney(n: number, currency: string): string {
   } catch {
     return `${currency} ${n.toFixed(2)}`;
   }
-}
-
-export function signed(t: Txn): number {
-  return t.kind === "income" ? t.amount : -t.amount;
 }
