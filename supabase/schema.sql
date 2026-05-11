@@ -8,8 +8,25 @@ create table if not exists public.transactions (
   amount numeric(14, 2) not null check (amount > 0),
   note text,
   date date not null,
+  category text check (category in ('bills', 'girlfriend', 'myself')),
   created_at timestamptz not null default now()
 );
+
+-- Idempotent migration for existing installs
+alter table public.transactions
+  add column if not exists category text;
+
+do $$ begin
+  if not exists (
+    select 1 from information_schema.table_constraints
+    where constraint_name = 'transactions_category_check'
+      and table_name = 'transactions'
+  ) then
+    alter table public.transactions
+      add constraint transactions_category_check
+      check (category in ('bills', 'girlfriend', 'myself'));
+  end if;
+end $$;
 
 create index if not exists transactions_user_date_idx
   on public.transactions (user_id, date desc);

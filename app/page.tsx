@@ -4,8 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Txn,
   Settings,
+  Category,
+  CATEGORIES,
   fetchTxns,
   insertTxn,
+  updateTxn,
   deleteTxnById,
   fetchSettings,
   upsertSettings,
@@ -17,14 +20,15 @@ import {
 } from "@/lib/storage";
 import { createClient } from "@/lib/supabase/client";
 
-type Tab = "home" | "add" | "settings";
+type Tab = "home" | "stats" | "add" | "settings";
+type Screen = { tab: Tab } | { tab: "edit"; txn: Txn };
 
 export default function Page() {
   const [loaded, setLoaded] = useState(false);
   const [txns, setTxns] = useState<Txn[]>([]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [email, setEmail] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("home");
+  const [screen, setScreen] = useState<Screen>({ tab: "home" });
   const [viewYM, setViewYM] = useState<string>(currentYM());
 
   useEffect(() => {
@@ -39,7 +43,6 @@ export default function Page() {
     })();
   }, []);
 
-  // Auto-log salary once on or after pay day each month
   useEffect(() => {
     if (!loaded) return;
     if (!settings.autoSalary || settings.salary <= 0) return;
@@ -54,6 +57,7 @@ export default function Page() {
           amount: settings.salary,
           note: "Salary",
           date: iso,
+          category: null,
         });
         if (created) {
           setTxns((prev) => [created, ...prev]);
@@ -86,12 +90,21 @@ export default function Page() {
   async function addTxn(t: Omit<Txn, "id" | "createdAt">) {
     const created = await insertTxn(t);
     if (created) setTxns((prev) => [created, ...prev]);
-    setTab("home");
+    setScreen({ tab: "home" });
+  }
+
+  async function saveEdit(id: string, t: Omit<Txn, "id" | "createdAt">) {
+    const updated = await updateTxn(id, t);
+    if (updated) {
+      setTxns((prev) => prev.map((x) => (x.id === id ? updated : x)));
+    }
+    setScreen({ tab: "home" });
   }
 
   async function deleteTxn(id: string) {
     const ok = await deleteTxnById(id);
     if (ok) setTxns((prev) => prev.filter((t) => t.id !== id));
+    setScreen({ tab: "home" });
   }
 
   async function updateSettings(s: Settings) {
@@ -122,7 +135,7 @@ export default function Page() {
 
   return (
     <main className="min-h-screen pb-24 max-w-md mx-auto px-4 pt-[max(env(safe-area-inset-top),1rem)]">
-      {tab === "home" && (
+      {screen.tab === "home" && (
         <Home
           settings={settings}
           viewYM={viewYM}
@@ -131,13 +144,36 @@ export default function Page() {
           expense={expense}
           balance={balance}
           txns={monthTxns}
-          onDelete={deleteTxn}
+          onEdit={(t) => setScreen({ tab: "edit", txn: t })}
         />
       )}
-      {tab === "add" && (
-        <AddForm settings={settings} onAdd={addTxn} onCancel={() => setTab("home")} />
+      {screen.tab === "stats" && (
+        <Stats
+          settings={settings}
+          viewYM={viewYM}
+          shiftMonth={shiftMonth}
+          txns={monthTxns}
+        />
       )}
-      {tab === "settings" && (
+      {screen.tab === "add" && (
+        <TxnForm
+          mode="create"
+          settings={settings}
+          onSubmit={addTxn}
+          onCancel={() => setScreen({ tab: "home" })}
+        />
+      )}
+      {screen.tab === "edit" && (
+        <TxnForm
+          mode="edit"
+          settings={settings}
+          initial={screen.txn}
+          onSubmit={(t) => saveEdit(screen.txn.id, t)}
+          onDelete={() => deleteTxn(screen.txn.id)}
+          onCancel={() => setScreen({ tab: "home" })}
+        />
+      )}
+      {screen.tab === "settings" && (
         <SettingsView
           settings={settings}
           onSave={updateSettings}
@@ -145,8 +181,43 @@ export default function Page() {
           onSignOut={signOut}
         />
       )}
-      <TabBar tab={tab} setTab={setTab} />
+      <TabBar
+        tab={screen.tab === "edit" ? "home" : screen.tab}
+        setTab={(t) => setScreen({ tab: t })}
+      />
     </main>
+  );
+}
+
+function MonthHeader({
+  viewYM,
+  shiftMonth,
+}: {
+  viewYM: string;
+  shiftMonth: (d: number) => void;
+}) {
+  const monthName = new Date(viewYM + "-01").toLocaleDateString(undefined, {
+    month: "long",
+    year: "numeric",
+  });
+  return (
+    <header className="flex items-center justify-between py-2">
+      <button
+        onClick={() => shiftMonth(-1)}
+        aria-label="Previous month"
+        className="text-neutral-400 px-3 py-2 active:text-white"
+      >
+        ‹
+      </button>
+      <h1 className="text-lg font-semibold">{monthName}</h1>
+      <button
+        onClick={() => shiftMonth(1)}
+        aria-label="Next month"
+        className="text-neutral-400 px-3 py-2 active:text-white"
+      >
+        ›
+      </button>
+    </header>
   );
 }
 
@@ -158,7 +229,7 @@ function Home({
   expense,
   balance,
   txns,
-  onDelete,
+  onEdit,
 }: {
   settings: Settings;
   viewYM: string;
@@ -167,31 +238,11 @@ function Home({
   expense: number;
   balance: number;
   txns: Txn[];
-  onDelete: (id: string) => void;
+  onEdit: (t: Txn) => void;
 }) {
-  const monthName = new Date(viewYM + "-01").toLocaleDateString(undefined, {
-    month: "long",
-    year: "numeric",
-  });
   return (
     <div>
-      <header className="flex items-center justify-between py-2">
-        <button
-          onClick={() => shiftMonth(-1)}
-          aria-label="Previous month"
-          className="text-neutral-400 px-3 py-2 active:text-white"
-        >
-          ‹
-        </button>
-        <h1 className="text-lg font-semibold">{monthName}</h1>
-        <button
-          onClick={() => shiftMonth(1)}
-          aria-label="Next month"
-          className="text-neutral-400 px-3 py-2 active:text-white"
-        >
-          ›
-        </button>
-      </header>
+      <MonthHeader viewYM={viewYM} shiftMonth={shiftMonth} />
 
       <section className="rounded-2xl bg-neutral-900 p-5 mt-2">
         <div className="text-sm text-neutral-400">Balance</div>
@@ -228,34 +279,37 @@ function Home({
           </div>
         ) : (
           <ul className="space-y-1">
-            {txns.map((t) => (
-              <li
-                key={t.id}
-                className="flex items-center justify-between rounded-xl bg-neutral-900 px-4 py-3"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium">
-                    {t.note || (t.kind === "income" ? "Income" : "Expense")}
-                  </div>
-                  <div className="text-xs text-neutral-500">{t.date}</div>
-                </div>
-                <div
-                  className={`tabular-nums font-medium mr-3 ${
-                    t.kind === "income" ? "text-green-400" : "text-red-400"
-                  }`}
-                >
-                  {t.kind === "income" ? "+" : "−"}
-                  {formatMoney(t.amount, settings.currency).replace(/^[-]/, "")}
-                </div>
-                <button
-                  onClick={() => onDelete(t.id)}
-                  aria-label="Delete"
-                  className="text-neutral-500 hover:text-red-400 active:text-red-400 px-2"
-                >
-                  ✕
-                </button>
-              </li>
-            ))}
+            {txns.map((t) => {
+              const cat = CATEGORIES.find((c) => c.id === t.category);
+              return (
+                <li key={t.id}>
+                  <button
+                    onClick={() => onEdit(t)}
+                    className="w-full flex items-center justify-between rounded-xl bg-neutral-900 px-4 py-3 active:bg-neutral-800 text-left"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-medium">
+                        {t.note || (t.kind === "income" ? "Income" : "Expense")}
+                      </div>
+                      <div className="text-xs text-neutral-500 flex items-center gap-2">
+                        <span>{t.date}</span>
+                        {cat && (
+                          <span className={`${cat.color}`}>· {cat.label}</span>
+                        )}
+                      </div>
+                    </div>
+                    <div
+                      className={`tabular-nums font-medium ml-3 ${
+                        t.kind === "income" ? "text-green-400" : "text-red-400"
+                      }`}
+                    >
+                      {t.kind === "income" ? "+" : "−"}
+                      {formatMoney(t.amount, settings.currency).replace(/^[-]/, "")}
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
@@ -263,28 +317,166 @@ function Home({
   );
 }
 
-function AddForm({
+function Stats({
   settings,
-  onAdd,
-  onCancel,
+  viewYM,
+  shiftMonth,
+  txns,
 }: {
   settings: Settings;
-  onAdd: (t: Omit<Txn, "id" | "createdAt">) => void;
+  viewYM: string;
+  shiftMonth: (d: number) => void;
+  txns: Txn[];
+}) {
+  const { byCategory, totalExpense, uncategorized } = useMemo(() => {
+    const byCategory: Record<Category, number> = {
+      bills: 0,
+      girlfriend: 0,
+      myself: 0,
+    };
+    let totalExpense = 0;
+    let uncategorized = 0;
+    for (const t of txns) {
+      if (t.kind !== "expense") continue;
+      totalExpense += t.amount;
+      if (t.category) byCategory[t.category] += t.amount;
+      else uncategorized += t.amount;
+    }
+    return { byCategory, totalExpense, uncategorized };
+  }, [txns]);
+
+  return (
+    <div>
+      <MonthHeader viewYM={viewYM} shiftMonth={shiftMonth} />
+
+      <section className="rounded-2xl bg-neutral-900 p-5 mt-2">
+        <div className="text-sm text-neutral-400">Total spent</div>
+        <div className="text-4xl font-bold mt-1 text-red-400">
+          {formatMoney(totalExpense, settings.currency)}
+        </div>
+      </section>
+
+      {totalExpense === 0 ? (
+        <div className="text-neutral-500 text-sm py-12 text-center">
+          No expenses yet this month.
+        </div>
+      ) : (
+        <>
+          <section className="mt-6">
+            <h2 className="text-sm uppercase tracking-wider text-neutral-500 mb-3">
+              By category
+            </h2>
+
+            {/* Stacked bar */}
+            <div className="flex h-3 rounded-full overflow-hidden bg-neutral-900">
+              {CATEGORIES.map((c) => {
+                const pct = totalExpense > 0 ? (byCategory[c.id] / totalExpense) * 100 : 0;
+                if (pct === 0) return null;
+                return (
+                  <div
+                    key={c.id}
+                    className={c.bar}
+                    style={{ width: `${pct}%` }}
+                    title={`${c.label}: ${pct.toFixed(1)}%`}
+                  />
+                );
+              })}
+              {uncategorized > 0 && (
+                <div
+                  className="bg-neutral-600"
+                  style={{ width: `${(uncategorized / totalExpense) * 100}%` }}
+                />
+              )}
+            </div>
+
+            <ul className="space-y-2 mt-4">
+              {CATEGORIES.map((c) => {
+                const amt = byCategory[c.id];
+                const pct = totalExpense > 0 ? (amt / totalExpense) * 100 : 0;
+                return (
+                  <li
+                    key={c.id}
+                    className="rounded-xl bg-neutral-900 px-4 py-3"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className={`inline-block w-2.5 h-2.5 rounded-full ${c.bar}`} />
+                        <span className="font-medium">{c.label}</span>
+                      </div>
+                      <div className="tabular-nums font-medium">
+                        {formatMoney(amt, settings.currency)}
+                      </div>
+                    </div>
+                    <div className="mt-2 h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full ${c.bar}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <div className="text-xs text-neutral-500 mt-1">
+                      {pct.toFixed(1)}% of expenses
+                    </div>
+                  </li>
+                );
+              })}
+              {uncategorized > 0 && (
+                <li className="rounded-xl bg-neutral-900 px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-block w-2.5 h-2.5 rounded-full bg-neutral-600" />
+                      <span className="font-medium text-neutral-400">
+                        Uncategorized
+                      </span>
+                    </div>
+                    <div className="tabular-nums font-medium">
+                      {formatMoney(uncategorized, settings.currency)}
+                    </div>
+                  </div>
+                </li>
+              )}
+            </ul>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TxnForm({
+  mode,
+  settings,
+  initial,
+  onSubmit,
+  onDelete,
+  onCancel,
+}: {
+  mode: "create" | "edit";
+  settings: Settings;
+  initial?: Txn;
+  onSubmit: (t: Omit<Txn, "id" | "createdAt">) => void | Promise<void>;
+  onDelete?: () => void | Promise<void>;
   onCancel: () => void;
 }) {
-  const [kind, setKind] = useState<"expense" | "income">("expense");
-  const [amount, setAmount] = useState("");
-  const [note, setNote] = useState("");
-  const [date, setDate] = useState(todayISO());
-  const [saving, setSaving] = useState(false);
+  const [kind, setKind] = useState<"expense" | "income">(initial?.kind ?? "expense");
+  const [amount, setAmount] = useState(initial ? String(initial.amount) : "");
+  const [note, setNote] = useState(initial?.note ?? "");
+  const [date, setDate] = useState(initial?.date ?? todayISO());
+  const [category, setCategory] = useState<Category | null>(initial?.category ?? "bills");
+  const [busy, setBusy] = useState(false);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     const n = parseFloat(amount);
     if (!isFinite(n) || n <= 0) return;
-    setSaving(true);
-    await onAdd({ kind, amount: n, note: note.trim(), date });
-    setSaving(false);
+    setBusy(true);
+    await onSubmit({
+      kind,
+      amount: n,
+      note: note.trim(),
+      date,
+      category: kind === "expense" ? category : null,
+    });
+    setBusy(false);
   }
 
   return (
@@ -293,13 +485,15 @@ function AddForm({
         <button type="button" onClick={onCancel} className="text-neutral-400 px-2 py-2">
           Cancel
         </button>
-        <h1 className="text-lg font-semibold">New entry</h1>
+        <h1 className="text-lg font-semibold">
+          {mode === "create" ? "New entry" : "Edit entry"}
+        </h1>
         <button
           type="submit"
-          disabled={saving}
+          disabled={busy}
           className="text-green-400 font-medium px-2 py-2 disabled:opacity-60"
         >
-          {saving ? "Saving…" : "Save"}
+          {busy ? "…" : "Save"}
         </button>
       </header>
 
@@ -330,13 +524,35 @@ function AddForm({
           type="number"
           inputMode="decimal"
           step="0.01"
-          autoFocus
+          autoFocus={mode === "create"}
           value={amount}
           onChange={(e) => setAmount(e.target.value)}
           placeholder="0.00"
           className="w-full bg-neutral-900 rounded-xl px-4 py-4 text-2xl tabular-nums outline-none focus:ring-2 focus:ring-green-500/40"
         />
       </label>
+
+      {kind === "expense" && (
+        <div className="mt-4">
+          <div className="text-sm text-neutral-400 mb-1">Category</div>
+          <div className="grid grid-cols-3 gap-2">
+            {CATEGORIES.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => setCategory(c.id)}
+                className={`py-3 rounded-xl font-medium text-sm ${
+                  category === c.id
+                    ? `bg-neutral-800 ${c.color} ring-2 ring-inset ring-current`
+                    : "bg-neutral-900 text-neutral-400"
+                }`}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <label className="block mt-4">
         <div className="text-sm text-neutral-400 mb-1">Note</div>
@@ -358,6 +574,18 @@ function AddForm({
           className="w-full bg-neutral-900 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-green-500/40"
         />
       </label>
+
+      {mode === "edit" && onDelete && (
+        <button
+          type="button"
+          onClick={() => {
+            if (confirm("Delete this entry?")) onDelete();
+          }}
+          className="w-full mt-6 bg-red-500/10 text-red-400 rounded-xl py-3 font-medium"
+        >
+          Delete
+        </button>
+      )}
     </form>
   );
 }
@@ -479,6 +707,9 @@ function TabBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
       <div className="bg-neutral-900 rounded-2xl flex items-center justify-between p-1">
         <TabBtn active={tab === "home"} onClick={() => setTab("home")}>
           Home
+        </TabBtn>
+        <TabBtn active={tab === "stats"} onClick={() => setTab("stats")}>
+          Stats
         </TabBtn>
         <button
           onClick={() => setTab("add")}

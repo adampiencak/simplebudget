@@ -1,6 +1,13 @@
 import { createClient } from "@/lib/supabase/client";
 
 export type TxnKind = "income" | "expense";
+export type Category = "bills" | "girlfriend" | "myself";
+
+export const CATEGORIES: { id: Category; label: string; color: string; bar: string }[] = [
+  { id: "bills", label: "Bills", color: "text-sky-400", bar: "bg-sky-400" },
+  { id: "girlfriend", label: "Girlfriend", color: "text-pink-400", bar: "bg-pink-400" },
+  { id: "myself", label: "Myself", color: "text-amber-400", bar: "bg-amber-400" },
+];
 
 export type Txn = {
   id: string;
@@ -8,6 +15,7 @@ export type Txn = {
   amount: number;
   note: string;
   date: string; // ISO yyyy-mm-dd
+  category: Category | null;
   createdAt: number;
 };
 
@@ -35,6 +43,7 @@ type TxnRow = {
   amount: number | string;
   note: string | null;
   date: string;
+  category: Category | null;
   created_at: string;
 };
 
@@ -45,9 +54,12 @@ function rowToTxn(r: TxnRow): Txn {
     amount: Number(r.amount),
     note: r.note ?? "",
     date: r.date,
+    category: r.category ?? null,
     createdAt: new Date(r.created_at).getTime(),
   };
 }
+
+const TXN_SELECT = "id,kind,amount,note,date,category,created_at";
 
 type SettingsRow = {
   user_id: string;
@@ -74,7 +86,7 @@ export async function fetchTxns(): Promise<Txn[]> {
   const supabase = createClient();
   const { data, error } = await supabase
     .from("transactions")
-    .select("id,kind,amount,note,date,created_at")
+    .select(TXN_SELECT)
     .order("date", { ascending: false })
     .order("created_at", { ascending: false });
   if (error) {
@@ -99,8 +111,33 @@ export async function insertTxn(
       amount: t.amount,
       note: t.note || null,
       date: t.date,
+      category: t.kind === "expense" ? t.category : null,
     })
-    .select("id,kind,amount,note,date,created_at")
+    .select(TXN_SELECT)
+    .single();
+  if (error || !data) {
+    console.error(error);
+    return null;
+  }
+  return rowToTxn(data as TxnRow);
+}
+
+export async function updateTxn(
+  id: string,
+  t: Omit<Txn, "id" | "createdAt">
+): Promise<Txn | null> {
+  const supabase = createClient();
+  const { data, error } = await supabase
+    .from("transactions")
+    .update({
+      kind: t.kind,
+      amount: t.amount,
+      note: t.note || null,
+      date: t.date,
+      category: t.kind === "expense" ? t.category : null,
+    })
+    .eq("id", id)
+    .select(TXN_SELECT)
     .single();
   if (error || !data) {
     console.error(error);
